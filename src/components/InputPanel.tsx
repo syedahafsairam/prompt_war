@@ -12,15 +12,18 @@ import {
   ArrowRight,
   Stethoscope,
   Trash2,
-  CheckCircle2
+  CheckCircle2,
+  Volume2
 } from 'lucide-react';
 import { SAMPLE_CASES } from '../data/sampleCases';
 import { SampleCase } from '../types';
+import { VoiceRecorderWidget } from './VoiceRecorderWidget';
 
 interface InputPanelProps {
   onAnalyze: (payload: {
     text: string;
     image?: { data: string; mimeType: string };
+    audio?: { data: string; mimeType: string; duration?: number; name?: string };
     urgencyHint?: string;
   }) => void;
   isLoading: boolean;
@@ -30,13 +33,13 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
   const [textInput, setTextInput] = useState('');
   const [urgencyHint, setUrgencyHint] = useState('Standard Clinical Assessment');
   const [selectedImage, setSelectedImage] = useState<{ data: string; mimeType: string; name?: string } | null>(null);
+  const [selectedAudio, setSelectedAudio] = useState<{ data: string; mimeType: string; duration: number; name: string } | null>(null);
+  const [isVoiceWidgetOpen, setIsVoiceWidgetOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
-  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [inputError, setInputError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const recognitionRef = useRef<any>(null);
 
   // Drag and drop handlers
   const handleDragOver = (e: React.DragEvent) => {
@@ -64,9 +67,15 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
   };
 
   const processFile = (file: File) => {
-    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/svg+xml'];
+    setInputError(null);
+    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (!validTypes.includes(file.type)) {
-      alert('Please upload an image file (JPG, PNG, WebP, or SVG).');
+      setInputError('Please upload an image file (JPEG, PNG, WebP, or GIF). Other file types are blocked for security.');
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      setInputError('File size exceeds the 10MB limit. Please attach a compressed image.');
       return;
     }
 
@@ -84,62 +93,18 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
 
   // Preset Selection
   const handleSelectPreset = (preset: SampleCase) => {
+    setInputError(null);
     setSelectedPresetId(preset.id);
     setTextInput(preset.rawText);
     setUrgencyHint(preset.category);
     if (preset.imageDataUri) {
       setSelectedImage({
         data: preset.imageDataUri,
-        mimeType: 'image/svg+xml',
-        name: `${preset.id}-visual.svg`,
+        mimeType: 'image/jpeg',
+        name: `${preset.id}-visual.jpg`,
       });
     } else {
       setSelectedImage(null);
-    }
-  };
-
-  // Speech Recognition
-  const toggleSpeechRecognition = () => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      alert('Speech recognition is not supported in this browser. Please type your notes or paste text.');
-      return;
-    }
-
-    if (isRecording) {
-      recognitionRef.current?.stop();
-      setIsRecording(false);
-      return;
-    }
-
-    try {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
-        }
-        setTextInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
-      };
-
-      recognition.onerror = () => {
-        setIsRecording(false);
-      };
-
-      recognition.onend = () => {
-        setIsRecording(false);
-      };
-
-      recognition.start();
-      recognitionRef.current = recognition;
-      setIsRecording(true);
-    } catch (err) {
-      console.error(err);
-      setIsRecording(false);
     }
   };
 
@@ -147,20 +112,38 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
   const handleReset = () => {
     setTextInput('');
     setSelectedImage(null);
+    setSelectedAudio(null);
     setSelectedPresetId(null);
+    setInputError(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   // Submit Handler
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!textInput.trim() && !selectedImage) {
-      alert('Please describe symptoms or attach an image/record before processing.');
+    setInputError(null);
+
+    if (!textInput.trim() && !selectedImage && !selectedAudio) {
+      setInputError('Please describe symptoms, attach an image/record, or record a voice note before processing.');
       return;
     }
+
+    if (textInput.length > 8000) {
+      setInputError('Input notes exceed the 8,000 character limit. Please shorten your narrative.');
+      return;
+    }
+
     onAnalyze({
       text: textInput.trim(),
       image: selectedImage ? { data: selectedImage.data, mimeType: selectedImage.mimeType } : undefined,
+      audio: selectedAudio
+        ? {
+            data: selectedAudio.data,
+            mimeType: selectedAudio.mimeType,
+            duration: selectedAudio.duration,
+            name: selectedAudio.name,
+          }
+        : undefined,
       urgencyHint,
     });
   };
@@ -182,7 +165,7 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
         </div>
 
         {/* Clear Button */}
-        {(textInput || selectedImage) && (
+        {(textInput || selectedImage || selectedAudio) && (
           <button
             onClick={handleReset}
             className="self-start sm:self-auto flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200"
@@ -295,30 +278,96 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
         {/* Text Note Input Area */}
         <div>
           <div className="flex items-center justify-between mb-1.5">
-            <label className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+            <label htmlFor="symptom-notes-input" className="text-xs font-semibold uppercase tracking-wider text-slate-400">
               Messy Human Health Intent (Notes / Symptoms / Vitals)
             </label>
             <button
               type="button"
-              onClick={toggleSpeechRecognition}
-              className={`flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium transition-colors ${
-                isRecording
-                  ? 'bg-rose-500/20 text-rose-300 animate-pulse border border-rose-500/30'
-                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              id="toggle-voice-input-btn"
+              onClick={() => setIsVoiceWidgetOpen((prev) => !prev)}
+              aria-expanded={isVoiceWidgetOpen}
+              aria-label={isVoiceWidgetOpen ? 'Close voice recording console' : 'Record voice note'}
+              className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500 ${
+                isVoiceWidgetOpen || selectedAudio
+                  ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40 shadow-sm shadow-rose-950/40'
+                  : 'border border-slate-800 bg-slate-950/60 text-slate-300 hover:border-slate-700 hover:bg-slate-800'
               }`}
-              title="Speak to dictate symptoms"
+              title="Record voice note using microphone"
             >
-              {isRecording ? <MicOff className="h-3.5 w-3.5 text-rose-400" /> : <Mic className="h-3.5 w-3.5" />}
-              <span>{isRecording ? 'Listening...' : 'Voice Dictation'}</span>
+              <Mic className="h-3.5 w-3.5 text-rose-400" />
+              <span>
+                {selectedAudio
+                  ? 'Voice Note Attached'
+                  : isVoiceWidgetOpen
+                  ? 'Close Voice Console'
+                  : 'Record Voice'}
+              </span>
             </button>
           </div>
 
+          {/* Voice Recording Widget */}
+          {isVoiceWidgetOpen && (
+            <VoiceRecorderWidget
+              isOpen={isVoiceWidgetOpen}
+              onClose={() => setIsVoiceWidgetOpen(false)}
+              onAppendTextToNotes={(spokenText) => {
+                setTextInput((prev) => {
+                  const trimmed = prev.trim();
+                  return trimmed ? `${trimmed}\n\n[Voice Note]: ${spokenText}` : spokenText;
+                });
+              }}
+              onAttachAudio={(audio) => {
+                setSelectedAudio(audio);
+              }}
+              attachedAudioName={selectedAudio?.name}
+              onRemoveAttachedAudio={() => setSelectedAudio(null)}
+            />
+          )}
+
+          {/* Attached Audio Mini Chip if Widget Closed */}
+          {selectedAudio && !isVoiceWidgetOpen && (
+            <div className="mb-2 flex items-center justify-between rounded-xl border border-emerald-500/40 bg-emerald-950/40 p-2.5 text-xs text-emerald-200">
+              <div className="flex items-center gap-2 min-w-0">
+                <Volume2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                <span className="font-semibold text-emerald-300">Voice Note Attached:</span>
+                <span className="truncate font-mono text-[11px] text-slate-200">{selectedAudio.name}</span>
+                <span className="text-[10px] text-slate-400 font-mono">({selectedAudio.duration}s)</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsVoiceWidgetOpen(true)}
+                  className="text-[11px] font-semibold text-cyan-400 hover:underline"
+                >
+                  Review
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedAudio(null)}
+                  aria-label="Remove attached voice note"
+                  className="rounded p-1 text-slate-400 hover:text-rose-400 transition-colors"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {inputError && (
+            <div className="mb-2 rounded-lg border border-rose-500/40 bg-rose-950/30 p-2.5 text-xs text-rose-300 flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
+              <span>{inputError}</span>
+            </div>
+          )}
+
           <div className="relative">
             <textarea
+              id="symptom-notes-input"
               value={textInput}
               onChange={(e) => setTextInput(e.target.value)}
               placeholder="Describe symptoms in your own raw words (e.g. 'Sudden intense pain behind ribs, sweating cold sweat, took one aspirin, left hand has weird prickling sensations, father had heart attack at 60...')"
               rows={4}
+              aria-label="Symptom notes and patient narrative"
               className="w-full rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-sm text-slate-100 placeholder-slate-500 transition-colors focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
               onKeyDown={(e) => {
                 if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -349,7 +398,7 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onAnalyze, isLoading }) 
           {/* Submit Action Button */}
           <button
             type="submit"
-            disabled={isLoading || (!textInput.trim() && !selectedImage)}
+            disabled={isLoading || (!textInput.trim() && !selectedImage && !selectedAudio)}
             className="flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-500 via-blue-600 to-indigo-600 px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-cyan-900/30 transition-all hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Sparkles className="h-4 w-4" />

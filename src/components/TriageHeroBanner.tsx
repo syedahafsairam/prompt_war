@@ -13,6 +13,7 @@ import {
   Gauge
 } from 'lucide-react';
 import { ClinicalAnalysisResult, TriageLevel } from '../types';
+import { EmergencyDialerButtons } from './EmergencyDialerButtons';
 
 interface TriageHeroBannerProps {
   result: ClinicalAnalysisResult;
@@ -219,19 +220,22 @@ FACILITY: ${result.recommendedFacility} | SPECIALTY: ${result.targetSpecialty}`;
           {/* Emergency Escalation Trigger */}
           <div className="mt-5">
             {isEmergency ? (
-              <button
-                onClick={onOpenHotlines}
-                className="w-full flex items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-3 text-xs font-black uppercase tracking-wider text-white shadow-lg shadow-rose-900/50 transition-all hover:bg-rose-500 active:scale-[0.98]"
-              >
-                <PhoneCall className="h-4 w-4 animate-bounce" />
-                <span>Call Emergency Dispatch (911 / 112)</span>
-              </button>
+              <div className="space-y-3">
+                <EmergencyDialerButtons showTitle={true} />
+                <button
+                  onClick={onOpenHotlines}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900/90 px-4 py-2.5 text-xs font-semibold text-slate-300 transition-colors hover:bg-slate-800 hover:text-white text-center"
+                >
+                  <PhoneCall className="h-4 w-4 shrink-0 text-rose-400" />
+                  <span>Full International Directory & Poison Centers</span>
+                </button>
+              </div>
             ) : (
               <button
                 onClick={onOpenHotlines}
-                className="w-full flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-2.5 text-xs font-semibold text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
+                className="w-full flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-2.5 text-xs font-semibold text-slate-300 transition-colors hover:bg-slate-800 hover:text-white text-center"
               >
-                <PhoneCall className="h-4 w-4 text-slate-400" />
+                <PhoneCall className="h-4 w-4 shrink-0 text-slate-400" />
                 <span>Emergency Hotlines Directory</span>
               </button>
             )}

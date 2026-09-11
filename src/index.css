@@ -29,3 +29,45 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #475569;
 }
+
+/* Dedicated Print Styles for Clinical SBAR Handover */
+@media print {
+  body {
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* Hide navigation, inputs, heroes, modals background, buttons */
+  .no-print,
+  nav,
+  footer,
+  header,
+  #app-input-panel,
+  #app-navigation,
+  .app-screen-only {
+    display: none !important;
+  }
+
+  /* Target the printable document container */
+  #printable-sbar-document {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+
+  /* Prevent awkward page break cuts */
+  .page-break-avoid {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+

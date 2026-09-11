@@ -23,9 +23,14 @@ import { ActionPlanChecklist } from './components/ActionPlanChecklist';
 import { DoctorVisitPrepCard } from './components/DoctorVisitPrepCard';
 import { EmergencyHotlinesModal } from './components/EmergencyHotlinesModal';
 import { HistoryDrawer } from './components/HistoryDrawer';
+import { JudgeDemoModal } from './components/JudgeDemoModal';
 import { SafetyDisclaimerFooter } from './components/SafetyDisclaimerFooter';
-import { ClinicalAnalysisResult } from './types';
+import { PrintableSBARDocumentModal } from './components/PrintableSBARDocumentModal';
+import { MultimodalClassificationAndPrescriptionPanel } from './components/MultimodalClassificationAndPrescriptionPanel';
+import { ClinicalAnalysisResult, SampleCase } from './types';
 import { SAMPLE_CASES } from './data/sampleCases';
+import { getTriageRepository } from './repository/triageRepository';
+import { openPrintWindowOrFallback } from './utils/printHandover';
 
 export default function App() {
   const [currentResult, setCurrentResult] = useState<ClinicalAnalysisResult | null>(null);
@@ -33,48 +38,63 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isHotlinesOpen, setIsHotlinesOpen] = useState<boolean>(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
+  const [isJudgeDemoOpen, setIsJudgeDemoOpen] = useState<boolean>(false);
+  const [isPrintModalOpen, setIsPrintModalOpen] = useState<boolean>(false);
+  const [isPopupBlocked, setIsPopupBlocked] = useState<boolean>(false);
   const [history, setHistory] = useState<ClinicalAnalysisResult[]>([]);
 
   const resultsRef = useRef<HTMLDivElement>(null);
+  const repo = getTriageRepository();
 
-  // Load history from localStorage on initial mount
+  // Load history from repository on initial mount
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem('healthbridge_history');
-      if (saved) {
-        setHistory(JSON.parse(saved));
+    async function loadStoredHistory() {
+      try {
+        const records = await repo.getAll();
+        setHistory(records);
+      } catch (e) {
+        console.warn('Failed to load local history from repository', e);
       }
-    } catch (e) {
-      console.warn('Failed to load local history', e);
     }
+    loadStoredHistory();
   }, []);
 
-  // Save history to localStorage
-  const saveToHistory = (item: ClinicalAnalysisResult) => {
-    setHistory((prev) => {
-      const updated = [item, ...prev.filter((p) => p.id !== item.id)].slice(0, 20);
-      try {
-        localStorage.setItem('healthbridge_history', JSON.stringify(updated));
-      } catch (e) {
-        console.warn('Failed to persist history', e);
-      }
-      return updated;
-    });
+  // Save history via repository abstraction
+  const saveToHistory = async (item: ClinicalAnalysisResult) => {
+    try {
+      await repo.save(item);
+      const updated = await repo.getAll();
+      setHistory(updated);
+    } catch (e) {
+      console.warn('Failed to persist history via repository', e);
+      setHistory((prev) => [item, ...prev.filter((p) => p.id !== item.id)].slice(0, 20));
+    }
   };
 
-  const handleClearHistory = () => {
-    setHistory([]);
+  const handleClearHistory = async () => {
     try {
-      localStorage.removeItem('healthbridge_history');
+      await repo.clear();
+      setHistory([]);
     } catch (e) {
-      console.warn('Failed to clear history', e);
+      console.warn('Failed to clear history via repository', e);
+      setHistory([]);
     }
+  };
+
+  // 1-Click Complete System Reset
+  const handleResetAll = async () => {
+    setCurrentResult(null);
+    setErrorMessage(null);
+    setIsLoading(false);
+    await handleClearHistory();
+    setIsJudgeDemoOpen(false);
   };
 
   // Trigger analysis call to server
   const handleAnalyze = async (payload: {
     text: string;
     image?: { data: string; mimeType: string };
+    audio?: { data: string; mimeType: string; duration?: number; name?: string };
     urgencyHint?: string;
   }) => {
     setIsLoading(true);
@@ -96,7 +116,7 @@ export default function App() {
 
       const data: ClinicalAnalysisResult = await response.json();
       setCurrentResult(data);
-      saveToHistory(data);
+      await saveToHistory(data);
 
       // Scroll smoothly to output
       setTimeout(() => {
@@ -110,8 +130,26 @@ export default function App() {
     }
   };
 
+  const handleSelectPresetCase = (c: SampleCase, autoRun = false) => {
+    if (autoRun) {
+      handleAnalyze({
+        text: c.rawText,
+        image: c.imageDataUri ? { data: c.imageDataUri, mimeType: 'image/jpeg' } : undefined,
+        urgencyHint: c.category,
+      });
+    }
+  };
+
   const handlePrint = () => {
-    window.print();
+    if (!currentResult) return;
+    const outcome = openPrintWindowOrFallback(currentResult);
+    if (outcome.isPopupBlocked) {
+      setIsPopupBlocked(true);
+      setIsPrintModalOpen(true);
+    } else {
+      setIsPopupBlocked(false);
+      setIsPrintModalOpen(true);
+    }
   };
 
   return (
@@ -120,6 +158,7 @@ export default function App() {
       <Navbar
         onOpenHotlines={() => setIsHotlinesOpen(true)}
         onOpenHistory={() => setIsHistoryOpen(true)}
+        onOpenJudgeDemo={() => setIsJudgeDemoOpen(true)}
         historyCount={history.length}
       />
 
@@ -232,6 +271,16 @@ export default function App() {
               onPrint={handlePrint}
             />
 
+            {/* 1b. Multimodal Classification & Medication Extraction Verification Panel */}
+            <MultimodalClassificationAndPrescriptionPanel
+              classification={currentResult.inputClassification}
+              sourceInputType={currentResult.sourceInputType}
+              extractedPrescriptions={currentResult.extractedPrescriptions}
+              onUpdatePrescriptionConfirmations={(updated) => {
+                setCurrentResult((prev) => (prev ? { ...prev, extractedPrescriptions: updated } : null));
+              }}
+            />
+
             {/* 2. Red-Flag Warnings & Contraindications */}
             <RedFlagsCard
               redFlags={currentResult.redFlags}
@@ -276,6 +325,24 @@ export default function App() {
           }, 150);
         }}
         onClearHistory={handleClearHistory}
+      />
+
+      {/* Dedicated Printable SBAR Handover Document Modal (Print & Inline Fallback) */}
+      {currentResult && (
+        <PrintableSBARDocumentModal
+          isOpen={isPrintModalOpen}
+          onClose={() => setIsPrintModalOpen(false)}
+          result={currentResult}
+          isPopupBlocked={isPopupBlocked}
+        />
+      )}
+
+      {/* Evaluator Guide & Judge Demo Hub Modal */}
+      <JudgeDemoModal
+        isOpen={isJudgeDemoOpen}
+        onClose={() => setIsJudgeDemoOpen(false)}
+        onSelectCase={handleSelectPresetCase}
+        onResetAll={handleResetAll}
       />
 
       {/* Footer with safety protocols & Hackathon attribution */}

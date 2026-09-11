@@ -1,5 +1,30 @@
 export type TriageLevel = 'EMERGENCY_RED' | 'URGENT_AMBER' | 'ROUTINE_GREEN' | 'SELF_CARE_BLUE';
 
+export type MultimodalInputType =
+  | 'GENERAL_SYMPTOM'
+  | 'PRESCRIPTION_DOCUMENT'
+  | 'TRAFFIC_NEWS_OTHER';
+
+export interface InputClassification {
+  detectedType: MultimodalInputType;
+  confidence: number; // 0-100%
+  reasons: string[];
+  source: 'gemini_multimodal' | 'deterministic_heuristics';
+  rawExtractedText?: string;
+}
+
+export type MultimodalInputClassification = InputClassification;
+
+export interface ExtractedPrescriptionItem {
+  id: string;
+  medicineName: string;
+  dose: string;
+  frequency: string;
+  indicationOrNotes?: string;
+  uncertaintyFlags: string[];
+  isConfirmedByUser: boolean;
+}
+
 export interface RedFlagAlert {
   id: string;
   title: string;
@@ -43,6 +68,9 @@ export interface ClinicalAnalysisResult {
   timestamp: string;
   rawInputSummary: string;
   hasImage: boolean;
+  sourceInputType?: MultimodalInputType;
+  inputClassification?: InputClassification;
+  extractedPrescriptions?: ExtractedPrescriptionItem[];
   triage: {
     level: TriageLevel;
     title: string;

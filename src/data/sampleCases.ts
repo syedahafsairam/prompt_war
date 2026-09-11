@@ -53,5 +53,15 @@ export const SAMPLE_CASES: SampleCase[] = [
     rawText: 'Diagnosed with Type 2 diabetes 8 years ago, last HbA1c was 8.6. Took off my socks today and found a quarter-sized yellowish blister on the ball of my right foot that popped. It has redness spreading about 2 inches around the border and mild odor, but strangely I don\'t feel any pain there at all.',
     imageDataUri: DIABETIC_SVG,
     hint: 'Tests diabetic neuropathy blind-spot warning, osteomyelitis risk mitigation, and urgent podiatry/wound clinic triage.'
+  },
+  {
+    id: 'traffic-news-nonclinical',
+    tag: 'Non-Clinical Test',
+    badgeColor: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30',
+    title: 'Highway Traffic Congestion & City News',
+    category: 'Non-Clinical Ingestion',
+    description: 'Pasted city highway traffic bulletin to test multimodal classifier guardrail for non-clinical content.',
+    rawText: 'Severe traffic congestion reported on Interstate 95 northbound between exits 14 and 18 due to scheduled roadwork and lane closures. Commuters are experiencing delays of up to 45 minutes. City transit recommends alternate arterial routes.',
+    hint: 'Tests Multimodal Input Classification for TRAFFIC_NEWS_OTHER and safe non-clinical advisory response.'
   }
 ];

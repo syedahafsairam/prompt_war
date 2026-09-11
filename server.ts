@@ -1,20 +1,20 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import { evaluateClinicalRules } from './src/engine/clinicalRuleEngine';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+
+// In-memory buffer for optional server-side session persistence
+const serverRecordsBuffer: any[] = [];
 
 // Lazy GoogleGenAI initialization
 let aiClient: GoogleGenAI | null = null;
@@ -38,29 +38,150 @@ app.get('/api/health', (req, res) => {
     status: 'healthy',
     service: 'HealthBridge Clinical Action Engine',
     hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    serverPersistenceEnabled: Boolean(process.env.ENABLE_SERVER_PERSISTENCE === 'true'),
     timestamp: new Date().toISOString(),
   });
 });
 
-// Clinical analysis endpoint
-app.post('/api/analyze-health-input', async (req, res) => {
-  try {
-    const { text, image, urgencyHint } = req.body;
+// Optional server persistence endpoints
+app.get('/api/triage-records', (req, res) => {
+  res.json(serverRecordsBuffer.slice(0, 30));
+});
 
-    if (!text && !image) {
-      return res.status(400).json({
-        error: 'Please provide either text notes or an image/document to analyze.',
+app.post('/api/triage-records', (req, res) => {
+  const record = req.body;
+  if (record && record.id) {
+    const existingIdx = serverRecordsBuffer.findIndex((r) => r.id === record.id);
+    if (existingIdx >= 0) {
+      serverRecordsBuffer[existingIdx] = record;
+    } else {
+      serverRecordsBuffer.unshift(record);
+      if (serverRecordsBuffer.length > 50) serverRecordsBuffer.pop();
+    }
+  }
+  res.json({ success: true, count: serverRecordsBuffer.length });
+});
+
+// Audio transcription endpoint using Gemini Flash multimodal capabilities
+app.post('/api/transcribe-audio', async (req, res) => {
+  try {
+    const { audioData, mimeType } = req.body;
+    if (!audioData) {
+      return res.status(400).json({ error: 'Audio data is required for transcription.' });
+    }
+
+    const ai = getGenAIClient();
+    if (!ai) {
+      return res.status(503).json({
+        error: 'Live server transcription requires GEMINI_API_KEY. Your audio recording is safely stored for clinical review.',
       });
     }
+
+    const cleanBase64 = audioData.includes(',') ? audioData.split(',')[1] : audioData;
+    const cleanMime = mimeType || 'audio/webm';
+
+    let transcribeTimer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      transcribeTimer = setTimeout(
+        () => reject(new Error('Audio transcription timed out (exceeded 30s).')),
+        30000
+      );
+    });
+
+    const transcribePromise = ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: cleanMime,
+              data: cleanBase64,
+            },
+          },
+          {
+            text: 'Provide an exact, verbatim clinical transcription of this patient voice recording. Accurately transcribe all medical symptoms, drug names, anatomical locations, and duration expressions. Output ONLY the transcribed text without conversational preamble or quotation marks.',
+          },
+        ],
+      },
+    });
+
+    let response: any;
+    try {
+      response = await Promise.race([transcribePromise, timeoutPromise]);
+    } finally {
+      if (transcribeTimer) clearTimeout(transcribeTimer);
+    }
+
+    const transcript = response.text?.trim() || '';
+    res.json({ transcript });
+  } catch (err: any) {
+    console.error('[Triage Server] Audio transcription error:', err);
+    res.status(500).json({
+      error: err.message || 'Failed to transcribe audio.',
+    });
+  }
+});
+
+// Clinical analysis endpoint
+app.post('/api/analyze-health-input', async (req, res) => {
+  const requestId = 'req_' + Math.random().toString(36).substring(2, 8);
+  const startTime = Date.now();
+
+  try {
+    const { text, image, audio, urgencyHint } = req.body;
+
+    if (!text && !image && !audio) {
+      return res.status(400).json({
+        error: 'Please provide either symptom notes, an image/document, or an audio recording to analyze.',
+      });
+    }
+
+    if (text && typeof text !== 'string') {
+      return res.status(400).json({ error: 'Text input must be a valid string.' });
+    }
+
+    if (text && text.length > 8000) {
+      return res.status(400).json({ error: 'Symptom notes exceed maximum permitted length (8,000 characters).' });
+    }
+
+    if (image) {
+      if (typeof image !== 'object' || !image.data) {
+        return res.status(400).json({ error: 'Invalid image payload format.' });
+      }
+      const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+      const mime = image.mimeType || 'image/jpeg';
+      if (!allowedMimes.includes(mime)) {
+        return res.status(400).json({ error: 'Unsupported image format. Allowed: JPEG, PNG, WEBP, GIF.' });
+      }
+    }
+
+    if (audio) {
+      if (typeof audio !== 'object' || !audio.data) {
+        return res.status(400).json({ error: 'Invalid audio payload format.' });
+      }
+    }
+
+    // Privacy-safe server log (no patient medical text or images logged to console)
+    console.log(
+      `[Triage Server] [${requestId}] Intake validated: textChars=${text ? text.length : 0}, hasImage=${Boolean(
+        image
+      )}, hasAudio=${Boolean(audio)}, urgencyHint=${urgencyHint || 'none'}`
+    );
 
     const ai = getGenAIClient();
 
     if (!ai) {
       // Return high-quality deterministic triage fallback if API key is not configured in local environment
-      const fallbackResult = generateDeterministicFallback(text || '', Boolean(image), urgencyHint);
+      const fallbackResult = evaluateClinicalRules({
+        text: text || '',
+        hasImage: Boolean(image),
+        imageDataUri: image?.data,
+        urgencyHint,
+      });
+      console.log(`[Triage Server] [${requestId}] Processed via Clinical Rule Engine (No GEMINI_API_KEY) in ${Date.now() - startTime}ms`);
       return res.json({
         ...fallbackResult,
-        _notice: 'Processed via Clinical Rule Base (No GEMINI_API_KEY detected in environment).',
+        _notice: 'Processed via Deterministic Clinical Rule Base (No GEMINI_API_KEY detected in environment).',
       });
     }
 
@@ -82,16 +203,36 @@ app.post('/api/analyze-health-input', async (req, res) => {
       });
     }
 
+    if (audio && audio.data) {
+      const cleanBase64 = audio.data.includes(',')
+        ? audio.data.split(',')[1]
+        : audio.data;
+      const mimeType = audio.mimeType || 'audio/webm';
+
+      contentsParts.push({
+        inlineData: {
+          mimeType,
+          data: cleanBase64,
+        },
+      });
+    }
+
     const clinicalPrompt = `
 You are HealthBridge, an advanced clinical triage engine and universal healthcare bridge for PromptWars x Techverse.
 Your objective: Take messy, unstructured human health inputs (raw photos of rashes/injuries/prescriptions, frantic voice notes, fragmented medical history) and turn them into:
-1. Immediate Triage Severity classification ('EMERGENCY_RED', 'URGENT_AMBER', 'ROUTINE_GREEN', or 'SELF_CARE_BLUE').
-2. Urgent Red-Flag alerts with immediate safety mitigations (e.g. Stroke FAST, Acute Coronary Syndrome, Anaphylaxis, Sepsis, Severe Internal Bleed).
-3. Plain-English patient guidance (de-jargonized, calm, clear, what to do and avoid).
-4. Standardized SBAR Clinical Handover (Situation, Background, Assessment, Recommendation) specifically formatted so a triage nurse or emergency physician can instantly act.
-5. Prioritized step-by-step clinical action plan with first aid and logistical checklists.
-6. Key questions to ask the doctor during the consultation.
-7. Vital signs to monitor and medication safety warnings (especially drug-drug interactions or unclear handwritten dosages).
+1. Explicit Multimodal Input Classification:
+   - Must be classified as one of: 'GENERAL_SYMPTOM' (symptom photos, clinical notes), 'PRESCRIPTION_DOCUMENT' (prescription slips, bottle labels, medication lists), or 'TRAFFIC_NEWS_OTHER' (non-clinical topics like traffic jams, news, sports, weather).
+   - Provide confidence (0-100) and specific evidence-based reasons.
+2. If input is 'PRESCRIPTION_DOCUMENT':
+   - Extract individual prescription items: medicineName, dose, frequency, indicationOrNotes, and uncertaintyFlags.
+   - MANDATORY SAFETY DIRECTIVE: NEVER invent or hallucinate unreadable dosages, strengths, or frequencies. If a dose is scribbled, blurry, or missing, mark dose as 'Unspecified / Illegible' and explicitly record an uncertainty flag (e.g. 'Dosage illegible - requires pharmacist verification').
+3. Immediate Triage Severity classification ('EMERGENCY_RED', 'URGENT_AMBER', 'ROUTINE_GREEN', or 'SELF_CARE_BLUE'). If TRAFFIC_NEWS_OTHER, set level to 'SELF_CARE_BLUE' with non-clinical advisory.
+4. Urgent Red-Flag alerts with immediate safety mitigations (e.g. Stroke FAST, Acute Coronary Syndrome, Anaphylaxis, Sepsis, Severe Internal Bleed).
+5. Plain-English patient guidance (de-jargonized, calm, clear, what to do and avoid).
+6. Standardized SBAR Clinical Handover (Situation, Background, Assessment, Recommendation) specifically formatted so a triage nurse or emergency physician can instantly act.
+7. Prioritized step-by-step clinical action plan with first aid and logistical checklists.
+8. Key questions to ask the doctor during the consultation.
+9. Vital signs to monitor and medication safety warnings (especially drug-drug interactions or unclear handwritten dosages).
 
 Input Text: "${text || 'No accompanying text, analyze image carefully.'}"
 User Urgency Hint: "${urgencyHint || 'Standard'}"
@@ -113,6 +254,41 @@ Respond STRICTLY conforming to the JSON schema.
         responseSchema: {
           type: Type.OBJECT,
           properties: {
+            inputClassification: {
+              type: Type.OBJECT,
+              properties: {
+                detectedType: {
+                  type: Type.STRING,
+                  description: "Must be one of 'GENERAL_SYMPTOM', 'PRESCRIPTION_DOCUMENT', 'TRAFFIC_NEWS_OTHER'",
+                },
+                confidence: { type: Type.INTEGER, description: "Classification confidence 0-100" },
+                reasons: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: "Evidence-based reasons justifying the classification"
+                },
+              },
+              required: ['detectedType', 'confidence', 'reasons'],
+            },
+            extractedPrescriptions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  medicineName: { type: Type.STRING },
+                  dose: { type: Type.STRING, description: "e.g. '50mg' or 'Unspecified / Illegible'" },
+                  frequency: { type: Type.STRING, description: "e.g. 'BID (twice daily)' or 'Unspecified'" },
+                  indicationOrNotes: { type: Type.STRING },
+                  uncertaintyFlags: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: "Warnings about illegible handwriting, missing dosage, or ambiguity. NEVER guess unreadable text."
+                  },
+                },
+                required: ['id', 'medicineName', 'dose', 'frequency', 'uncertaintyFlags'],
+              },
+            },
             triage: {
               type: Type.OBJECT,
               properties: {
@@ -238,20 +414,47 @@ Respond STRICTLY conforming to the JSON schema.
       },
     });
 
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Clinical generation timeout (exceeded 12s)')), 12000)
-    );
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(
+        () => reject(new Error('Clinical generation timeout (exceeded 45s)')),
+        45000
+      );
+    });
 
-    const response: any = await Promise.race([geminiCallPromise, timeoutPromise]);
+    let response: any;
+    try {
+      response = await Promise.race([geminiCallPromise, timeoutPromise]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
 
-    const parsedJson = JSON.parse(response.text || '{}');
+    const rawText = response.text?.trim() || '{}';
+    let cleanJson = rawText;
+    if (cleanJson.startsWith('```')) {
+      cleanJson = cleanJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    }
+    const parsedJson = JSON.parse(cleanJson || '{}');
 
     // Assemble final response
+    const detectedType = parsedJson.inputClassification?.detectedType || (image ? 'GENERAL_SYMPTOM' : 'GENERAL_SYMPTOM');
     const finalResult = {
       id: 'hb-' + Math.random().toString(36).substring(2, 9),
       timestamp: new Date().toISOString(),
       rawInputSummary: text ? (text.slice(0, 140) + (text.length > 140 ? '...' : '')) : 'Image/Document input processed',
       hasImage: Boolean(image),
+      sourceInputType: detectedType,
+      inputClassification: parsedJson.inputClassification || {
+        detectedType,
+        confidence: parsedJson.confidenceScore || 90,
+        reasons: ['Processed via Gemini multimodal clinical vision & language understanding'],
+        source: 'gemini_multimodal',
+      },
+      extractedPrescriptions: (parsedJson.extractedPrescriptions || []).map((p: any, idx: number) => ({
+        ...p,
+        id: p.id || `med-${idx + 1}`,
+        isConfirmedByUser: false,
+      })),
       triage: parsedJson.triage,
       redFlags: parsedJson.redFlags || [],
       sbar: parsedJson.sbar,
@@ -270,162 +473,25 @@ Respond STRICTLY conforming to the JSON schema.
       },
     };
 
+    console.log(`[Triage Server] [${requestId}] Completed successfully via Gemini 3.8 Flash in ${Date.now() - startTime}ms`);
     return res.json(finalResult);
   } catch (error: any) {
-    console.error('Error analyzing health input:', error);
-    // Graceful fallback on API errors so user always gets a helpful clinical response
-    const fallback = generateDeterministicFallback(req.body.text || '', Boolean(req.body.image), req.body.urgencyHint);
+    console.warn(`[Triage Server] [${requestId}] Gemini error or timeout (${error.message || 'unknown'}). Falling back to Clinical Rule Engine.`);
+
+    // Graceful fallback so user always receives immediate life-saving guidance
+    const fallback = evaluateClinicalRules({
+      text: req.body?.text || '',
+      hasImage: Boolean(req.body?.image),
+      imageDataUri: req.body?.image?.data,
+      urgencyHint: req.body?.urgencyHint,
+    });
+
     return res.json({
       ...fallback,
-      _errorNote: 'Gemini upstream rate limit or API transient issue handled gracefully via Clinical Safety Guardrail.',
+      _errorNote: 'Gemini upstream API issue handled gracefully via HealthBridge Clinical Safety Guardrail.',
     });
   }
 });
-
-// Deterministic clinical engine fallback
-function generateDeterministicFallback(input: string, hasImg: boolean, urgencyHint?: string) {
-  const lower = input.toLowerCase();
-  const isCardiac = lower.includes('chest') || lower.includes('heart') || lower.includes('arm') || lower.includes('jaw') || lower.includes('crushing');
-  const isPediatric = lower.includes('child') || lower.includes('daughter') || lower.includes('son') || lower.includes('3yo') || lower.includes('fever') || lower.includes('rash') || lower.includes('baby');
-  const isMedication = lower.includes('warfarin') || lower.includes('ibuprofen') || lower.includes('pill') || lower.includes('rx') || lower.includes('prescription') || lower.includes('dose');
-
-  let level = 'URGENT_AMBER';
-  let title = 'Urgent Clinical Evaluation Advised';
-  let timeframe = 'Within 2 to 4 hours';
-  let score = 7;
-  let rationale = 'Patient symptoms indicate significant systemic distress requiring professional in-person medical evaluation.';
-
-  if (isCardiac) {
-    level = 'EMERGENCY_RED';
-    title = 'CRITICAL: Potential Acute Coronary Event / Cardiac Emergency';
-    timeframe = 'Immediate (Call 911 / 112 now)';
-    score = 10;
-    rationale = 'Substernal crushing discomfort radiating to extremities represents a potential life-threatening myocardial infarction until ruled out by ECG.';
-  } else if (isPediatric && (lower.includes('stiff') || lower.includes('glass') || lower.includes('spots') || lower.includes('fade'))) {
-    level = 'EMERGENCY_RED';
-    title = 'CRITICAL: Pediatric Non-Blanching Rash & High Pyrexia';
-    timeframe = 'Immediate Emergency Transport';
-    score = 9;
-    rationale = 'Non-blanching purpuric rash with fever and neck stiffness is a hallmark red-flag for invasive meningococcal disease or sepsis.';
-  } else if (isMedication && (lower.includes('bleed') || lower.includes('tarry') || lower.includes('stool') || lower.includes('bruis'))) {
-    level = 'URGENT_AMBER';
-    title = 'Urgent: High Risk Anticoagulant Interaction & Gastrointestinal Bleed';
-    timeframe = 'Seek Immediate Emergency / Urgent Care within 2 Hours';
-    score = 8;
-    rationale = 'Concurrent use of NSAIDs with Warfarin coupled with black tarry stools suggests acute upper GI hemorrhage.';
-  }
-
-  return {
-    id: 'hb-safe-' + Math.random().toString(36).substring(2, 9),
-    timestamp: new Date().toISOString(),
-    rawInputSummary: input ? input.slice(0, 120) + '...' : 'Uploaded visual assessment',
-    hasImage: hasImg,
-    triage: {
-      level,
-      title,
-      timeframe,
-      score,
-      rationale,
-    },
-    redFlags: [
-      {
-        id: 'rf-1',
-        title: isCardiac ? 'Acute Coronary Syndrome Risk' : isPediatric ? 'Invasive Sepsis / Meningococcal Screen' : 'Drug-Induced Hemorrhagic Risk',
-        riskFactor: isCardiac ? 'Crushing substernal pressure radiating to jaw/arm' : isPediatric ? 'Non-blanching purpura with stiff neck' : 'NSAID + Blood Thinner synergistic mucosal erosion',
-        criticalWarning: 'Do NOT drive oneself. Do not attempt unverified home remedies.',
-        immediateMitigation: 'Activate emergency medical services immediately or present to nearest emergency department.',
-      },
-    ],
-    sbar: {
-      situation: isCardiac
-        ? '58yo individual presenting with acute onset crushing retrosternal chest discomfort radiating to left arm and jaw.'
-        : isPediatric
-        ? '3yo toddler with high fever (39.8C) and newly emerging non-blanching petechial lesions on trunk and limbs.'
-        : 'Patient on anticoagulation therapy experiencing black tarry stools and spontaneous ecchymosis after NSAID exposure.',
-      background: 'Extracted from patient input: sudden symptom evolution over recent hours without resolution.',
-      assessment: isCardiac
-        ? 'Differential: ST-elevation myocardial infarction (STEMI) vs. unstable angina vs. aortic dissection.'
-        : isPediatric
-        ? 'Differential: Meningococcemia, bacterial meningitis, or Henoch-Schonlein purpura.'
-        : 'Differential: Acute upper gastrointestinal hemorrhage secondary to Warfarin-NSAID drug interaction.',
-      recommendation: 'Immediate medical physician evaluation, STAT baseline diagnostics (ECG, Troponin, CBC/Coagulation panel, or Blood Cultures), and urgent stabilization.',
-      vitalTriggers: ['Blood pressure < 90/60 or > 180/110', 'Heart rate > 120 bpm', 'SpO2 < 94% room air', 'Temperature > 39.5°C'],
-    },
-    patientSummary: {
-      plainEnglish: 'We have processed your symptoms through our clinical safety system. Because of the warning signs detected, this situation requires immediate hands-on medical attention. You should not wait to see if it gets better on its own.',
-      keyFindings: [
-        'Acute onset of high-risk physiological indicators',
-        'Specific warning signs that warrant immediate in-person clinician triage',
-        'Requires objective diagnostic equipment (ECG, bloodwork, vitals monitoring)',
-      ],
-      whatToAvoid: [
-        'Do NOT operate a motor vehicle or drive yourself to the clinic',
-        'Do NOT take unprescribed painkillers or antacids which may mask worsening symptoms',
-        'Do NOT perform strenuous physical activity or exert yourself',
-      ],
-    },
-    actionSteps: [
-      {
-        id: 'act-1',
-        stepNumber: 1,
-        title: 'Activate Emergency Care or Arrange Transport',
-        instruction: 'Call local emergency services (911 / 112) or have a family member drive you immediately to the nearest Emergency Department.',
-        priority: 'CRITICAL',
-        category: 'FIRST_AID',
-      },
-      {
-        id: 'act-2',
-        stepNumber: 2,
-        title: 'Gather Current Medications & Medical IDs',
-        instruction: 'Place all pill bottles, recent doctor notes, and identification into a single bag to hand to the triage nurse upon arrival.',
-        priority: 'HIGH',
-        category: 'LOGISTICS',
-      },
-      {
-        id: 'act-3',
-        stepNumber: 3,
-        title: 'Present HealthBridge SBAR Clinician Handover',
-        instruction: 'Open the Clinician Handover tab on your phone or show the SBAR summary directly to the receiving triage nurse.',
-        priority: 'HIGH',
-        category: 'LOGISTICS',
-      },
-    ],
-    questionsForDoctor: [
-      'What specific diagnostic tests (ECG, bloodwork, imaging) are being ordered to rule out critical causes?',
-      'Should I temporarily pause or adjust any of my daily medications?',
-      'What exact symptoms should prompt immediate return if I am discharged?',
-    ],
-    targetSpecialty: isCardiac ? 'Emergency Cardiology' : isPediatric ? 'Pediatric Emergency Medicine' : 'Emergency Medicine & Gastroenterology',
-    recommendedFacility: 'Hospital Emergency Department with 24/7 Acute Diagnostic Capabilities',
-    prescriptionsOrMedsDetected: isMedication ? [
-      {
-        name: 'Warfarin + High-Dose Ibuprofen',
-        notes: 'Significant risk of major gastrointestinal hemorrhage.',
-        cautionaryWarning: 'Discontinue NSAID immediately under physician supervision.',
-      },
-    ] : [],
-    vitalSignsToWatch: [
-      {
-        metric: 'Heart Rate',
-        normalRange: '60 - 100 bpm',
-        warningThreshold: '< 50 or > 120 bpm',
-        instruction: 'Check pulse at wrist or with smartwatch if safely seated.',
-      },
-      {
-        metric: 'Respiratory Rate',
-        normalRange: '12 - 20 breaths/min',
-        warningThreshold: '> 25 breaths/min or labored breathing',
-        instruction: 'Note if speech is broken by breathlessness.',
-      },
-    ],
-    verificationMetadata: {
-      model: 'gemini-3.8-flash-clinical-engine',
-      protocol: 'HealthBridge Clinical Decision Support Framework v4.2',
-      samdCheckPassed: true,
-      confidenceScore: 94,
-    },
-  };
-}
 
 async function startServer() {
   // Vite middleware for development
