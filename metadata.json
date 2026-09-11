@@ -1,0 +1,6 @@
+{
+  "name": "HealthBridge - Clinical Action Engine",
+  "description": "A universal Gemini-powered bridge between messy human health inputs and structured, verified clinical action plans.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
